@@ -1,3 +1,4 @@
+# Fork deployment activation
 name: AnyRouter 自动签到
 on:
   schedule:
