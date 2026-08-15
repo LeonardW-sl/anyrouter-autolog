@@ -93,7 +93,15 @@ Expected: HTTP status `200` (or the Feishu endpoint's successful HTTP response) 
 - [ ] **Step 1: Trigger the workflow manually**
 
 ```bash
+BEFORE=$(gh run list --repo LeonardW-sl/anyrouter-autolog --workflow 334879976 --limit 1 --json databaseId --jq '.[0].databaseId // 0')
 gh workflow run 334879976 --repo LeonardW-sl/anyrouter-autolog --ref main
+for _ in $(seq 1 30); do
+  RUN_ID=$(gh run list --repo LeonardW-sl/anyrouter-autolog --workflow 334879976 --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId')
+  [ "$RUN_ID" != "$BEFORE" ] && break
+  sleep 2
+done
+test -n "$RUN_ID" && [ "$RUN_ID" != "$BEFORE" ]
+printf 'RUN_ID=%s\n' "$RUN_ID"
 ```
 
 Expected: command exits `0` and a new run is created.
@@ -101,7 +109,7 @@ Expected: command exits `0` and a new run is created.
 - [ ] **Step 2: Wait for the run and inspect sanitized status**
 
 ```bash
-gh run watch <new-run-id> --repo LeonardW-sl/anyrouter-autolog --exit-status
+gh run watch $RUN_ID --repo LeonardW-sl/anyrouter-autolog --exit-status
 ```
 
 Expected: exit code `0`; workflow conclusion `success`.
@@ -109,7 +117,7 @@ Expected: exit code `0`; workflow conclusion `success`.
 - [ ] **Step 3: Check only account count and final success summary**
 
 ```bash
-gh run view <new-run-id> --repo LeonardW-sl/anyrouter-autolog --log \
+gh run view $RUN_ID --repo LeonardW-sl/anyrouter-autolog --log \
   | grep -E 'Found [0-9]+ account|Success:|All accounts|Message push successful|Message push failed|notification skipped'
 ```
 
