@@ -520,7 +520,12 @@ def build_check_in_result(
 	}
 
 
-def _read_quota_baseline(domain: str, session_cookie: str | None, api_user: str | None) -> tuple[int | None, bool]:
+def _read_quota_baseline(
+	domain: str,
+	session_cookie: str | None,
+	api_user: str | None,
+	waf_cookies: dict[str, str] | None = None,
+) -> tuple[int | None, bool]:
 	"""用旧 session 读签到前额度作为基线
 
 	纯读操作，不触发签到。拿不到就返回 (None, False)，后续判定改用日志证据。
@@ -528,8 +533,9 @@ def _read_quota_baseline(domain: str, session_cookie: str | None, api_user: str 
 	if not session_cookie:
 		return None, False
 
+	cookies = {**(waf_cookies or {}), 'session': session_cookie}
 	try:
-		with httpx.Client(http2=True, timeout=30.0, cookies={'session': session_cookie}) as client:
+		with httpx.Client(http2=True, timeout=30.0, cookies=cookies) as client:
 			user = fetch_user_self(client, domain, api_user)
 	except Exception:
 		return None, False
@@ -547,10 +553,14 @@ def check_in_via_password(
 	api_user: str | None = None,
 	session_cookie: str | None = None,
 	login_path: str = '/api/user/login',
+	waf_cookies: dict[str, str] | None = None,
 ) -> tuple[bool, dict | None, str | None]:
 	"""用密码重新登录完成一次签到
 
 	比 OAuth 重放简单一个数量级：没有上游站点，也就没有反爬和跨站跳转。
+
+	waf_cookies 是浏览器解完阿里云 WAF 挑战拿到的凭据。机房 IP（比如 GitHub
+	Actions）直连会被 HTTP 200 + JS 挑战页顶回来，必须带上；住宅 IP 一般不需要。
 
 	Returns:
 		(success, result, error)
@@ -558,13 +568,13 @@ def check_in_via_password(
 	if not username or not password:
 		return False, None, '未配置 username/password，无法用密码登录签到'
 
-	quota_before, quota_before_fresh = _read_quota_baseline(domain, session_cookie, api_user)
+	quota_before, quota_before_fresh = _read_quota_baseline(domain, session_cookie, api_user, waf_cookies)
 	if quota_before is not None:
 		print(f'[INFO] {account_name}: 签到前余额 ${quota_to_usd(quota_before)}')
 	else:
 		print(f'[INFO] {account_name}: 未取到签到前余额基线，将改用站内日志核验')
 
-	with httpx.Client(http2=True, timeout=30.0, follow_redirects=False) as client:
+	with httpx.Client(http2=True, timeout=30.0, follow_redirects=False, cookies=waf_cookies or None) as client:
 		user, error = password_login(client, domain, username, password, login_path)
 		if user is None:
 			return False, None, error
@@ -593,8 +603,12 @@ def check_in_via_oauth(
 	api_user: str | None = None,
 	session_cookie: str | None = None,
 	provider: OAuthProvider = GITHUB,
+	waf_cookies: dict[str, str] | None = None,
 ) -> tuple[bool, dict | None, str | None]:
 	"""重放上游 OAuth 完成一次签到
+
+	waf_cookies 见 check_in_via_password 的说明——只加到本站的 client 上，
+	上游那一跳（github/linuxdo）用独立请求，不受影响。
 
 	Returns:
 		(success, result, error) —— success 表示链路走通且有签到证据
@@ -602,14 +616,14 @@ def check_in_via_oauth(
 	if not upstream_cookie:
 		return False, None, f'未配置 {provider.name} cookie，无法重放 OAuth'
 
-	quota_before, quota_before_fresh = _read_quota_baseline(domain, session_cookie, api_user)
+	quota_before, quota_before_fresh = _read_quota_baseline(domain, session_cookie, api_user, waf_cookies)
 	if quota_before is not None:
 		print(f'[INFO] {account_name}: 签到前余额 ${quota_to_usd(quota_before)}')
 	else:
 		print(f'[INFO] {account_name}: 未取到签到前余额基线，将改用站内日志核验')
 
 	# state 与 callback 必须共用 cookie jar：state 下发的匿名 session 是回调的校验凭据
-	with httpx.Client(http2=True, timeout=30.0, follow_redirects=False) as client:
+	with httpx.Client(http2=True, timeout=30.0, follow_redirects=False, cookies=waf_cookies or None) as client:
 		state, error = fetch_oauth_state(client, domain)
 		if not state:
 			return False, None, error

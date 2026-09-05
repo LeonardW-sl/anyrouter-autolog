@@ -319,7 +319,7 @@ def shape_check_in_result(result: dict, success: bool, account_name: str):
 	return user_info_before, user_info_after
 
 
-def check_in_with_password(account: AccountConfig, account_name: str, provider_config):
+def check_in_with_password(account: AccountConfig, account_name: str, provider_config, waf_cookies: dict | None = None):
 	"""用账号密码重新登录触发签到
 
 	依次尝试主域名与备用域名，返回与普通签到一致的三元组。
@@ -338,6 +338,7 @@ def check_in_with_password(account: AccountConfig, account_name: str, provider_c
 			api_user=account.api_user,
 			session_cookie=account.get_session_cookie(),
 			login_path=provider_config.login_api_path,
+			waf_cookies=waf_cookies,
 		)
 
 		if result:
@@ -350,7 +351,9 @@ def check_in_with_password(account: AccountConfig, account_name: str, provider_c
 	return False, {'success': False, 'error': last_error or 'Password check-in failed'}, None
 
 
-def check_in_with_github_oauth(account: AccountConfig, account_name: str, provider_config):
+def check_in_with_github_oauth(
+	account: AccountConfig, account_name: str, provider_config, waf_cookies: dict | None = None
+):
 	"""重放 GitHub OAuth 完成签到（agentrouter 这类无签到接口的站点）
 
 	依次尝试主域名与备用域名，返回与普通签到一致的三元组。
@@ -376,6 +379,7 @@ def check_in_with_github_oauth(account: AccountConfig, account_name: str, provid
 			api_user=account.api_user,
 			session_cookie=account.get_session_cookie(),
 			provider=oauth_provider,
+			waf_cookies=waf_cookies,
 		)
 
 		if result:
@@ -400,24 +404,35 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
 
-	# 密码登录：一个 POST 就能触发签到，不碰上游站点
-	if provider_config.uses_password_login():
-		if not account.has_password_credentials():
-			print(f'[FAILED] {account_name}: Provider requires username/password but none configured')
-			return False, {'success': False, 'error': 'username/password not configured'}, None
-		return check_in_with_password(account, account_name, provider_config)
+	# 登录触发型站点（agentrouter）。这两条路径本身是纯 HTTP，但站点在阿里云 WAF
+	# 后面：住宅 IP 直连没事，机房 IP 会被 HTTP 200 + JS 挑战页顶回来，所以先用
+	# 浏览器解一次挑战，把 cookie 带进后面的请求。
+	login_triggered = provider_config.uses_password_login() or provider_config.uses_github_oauth()
+	if login_triggered:
+		waf_cookies = None
+		if provider_config.needs_waf_cookies():
+			login_url = f'{provider_config.domain}{provider_config.login_path}'
+			waf_cookies = await get_waf_cookies_with_playwright(
+				account_name, login_url, provider_config.waf_cookie_names
+			)
+			if not waf_cookies:
+				print(f'[WARNING] {account_name}: WAF cookies unavailable, trying direct request anyway')
 
-	# 账号配了密码就优先用它，比 OAuth 重放稳
-	if provider_config.uses_github_oauth() and account.has_password_credentials():
-		print(f'[INFO] {account_name}: Password credentials present, preferring password login over OAuth')
-		return check_in_with_password(account, account_name, provider_config)
+		if provider_config.uses_password_login():
+			if not account.has_password_credentials():
+				print(f'[FAILED] {account_name}: Provider requires username/password but none configured')
+				return False, {'success': False, 'error': 'username/password not configured'}, None
+			return check_in_with_password(account, account_name, provider_config, waf_cookies)
 
-	# OAuth 重放路径不需要站内 cookies，也不需要浏览器
-	if provider_config.uses_github_oauth():
+		# 账号配了密码就优先用它，比 OAuth 重放稳
+		if account.has_password_credentials():
+			print(f'[INFO] {account_name}: Password credentials present, preferring password login over OAuth')
+			return check_in_with_password(account, account_name, provider_config, waf_cookies)
+
 		if not account.oauth_cookie:
 			print(f'[FAILED] {account_name}: Provider requires oauth_cookie but none configured')
 			return False, {'success': False, 'error': 'oauth_cookie not configured'}, None
-		return check_in_with_github_oauth(account, account_name, provider_config)
+		return check_in_with_github_oauth(account, account_name, provider_config, waf_cookies)
 
 	user_cookies = parse_cookies(account.cookies)
 	if not user_cookies:

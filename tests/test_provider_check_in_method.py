@@ -24,12 +24,13 @@ class TestAgentRouterDefaults:
 		assert provider.needs_manual_check_in() is False
 		assert provider.sign_in_path is None
 
-	def test_no_playwright_needed(self):
-		"""acw_tc 直接 curl 就能拿到，不该起浏览器"""
+	def test_needs_waf_cookies(self):
+		"""站点在阿里云 WAF 后面：机房 IP 直连会被 JS 挑战页顶回来（CI 实测）"""
 		provider = AppConfig.load_from_env().get_provider('agentrouter')
 
-		assert provider.needs_waf_cookies() is False
-		assert provider.bypass_method is None
+		assert provider.needs_waf_cookies() is True
+		assert provider.bypass_method == 'waf_cookies'
+		assert 'acw_sc__v2' in provider.waf_cookie_names
 
 	def test_backup_domain_available(self):
 		provider = AppConfig.load_from_env().get_provider('agentrouter')

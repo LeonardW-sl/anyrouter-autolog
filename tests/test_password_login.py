@@ -11,11 +11,24 @@ import httpx
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
+import pytest
+
 import checkin
 from utils.agentrouter_oauth import REWARD_UNITS, password_login
 from utils.config import AccountConfig, AppConfig, ProviderConfig, load_accounts_config
 
 DOMAIN = 'https://agentrouter.org'
+FAKE_WAF = {'acw_tc': 'a', 'cdn_sec_tc': 'b', 'acw_sc__v2': 'c'}
+
+
+@pytest.fixture(autouse=True)
+def stub_waf(monkeypatch):
+	"""agentrouter 现在要过阿里云 WAF，单元测试不该真起浏览器"""
+
+	async def fake_waf(account_name, login_url, required):
+		return dict(FAKE_WAF)
+
+	monkeypatch.setattr(checkin, 'get_waf_cookies_with_playwright', fake_waf)
 
 
 def make_client(handler) -> httpx.Client:

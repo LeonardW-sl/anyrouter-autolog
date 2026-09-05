@@ -114,7 +114,11 @@ class AppConfig:
 				waf_cookie_names=['acw_tc', 'cdn_sec_tc', 'acw_sc__v2'],
 			),
 			# agentrouter 没有签到接口：每日 $25 由服务端登录 handler 发放，
-			# 必须重放一次 GitHub OAuth 登录才会触发。带旧 session 查任何接口都没用。
+			# 必须重放一次登录才会触发。带旧 session 查任何接口都没用。
+			#
+			# 同样在阿里云 WAF 后面：住宅 IP 直连没事，机房 IP（GitHub Actions）
+			# 会被 HTTP 200 + JS 挑战页顶回来（body 里有 aliyun_waf_aa 标记），
+			# 所以和 anyrouter 一样要先用浏览器解挑战拿 cookie。
 			'agentrouter': ProviderConfig(
 				name='agentrouter',
 				domain='https://agentrouter.org',
@@ -122,8 +126,8 @@ class AppConfig:
 				sign_in_path=None,
 				user_info_path='/api/user/self',
 				api_user_key='new-api-user',
-				bypass_method=None,  # acw_tc 直接 curl 就能拿到，无需 Playwright
-				waf_cookie_names=None,
+				bypass_method='waf_cookies',
+				waf_cookie_names=['acw_tc', 'cdn_sec_tc', 'acw_sc__v2'],
 				check_in_method='github_oauth',
 				backup_domain='https://ps.air-outer.com',
 			),

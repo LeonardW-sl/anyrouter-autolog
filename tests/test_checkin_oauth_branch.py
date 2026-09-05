@@ -8,9 +8,23 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
+import pytest
+
 import checkin
 from utils.agentrouter_oauth import REWARD_UNITS
 from utils.config import AccountConfig, AppConfig
+
+FAKE_WAF = {'acw_tc': 'a', 'cdn_sec_tc': 'b', 'acw_sc__v2': 'c'}
+
+
+@pytest.fixture(autouse=True)
+def stub_waf(monkeypatch):
+	"""agentrouter 现在要过阿里云 WAF，单元测试不该真起浏览器"""
+
+	async def fake_waf(account_name, login_url, required):
+		return dict(FAKE_WAF)
+
+	monkeypatch.setattr(checkin, 'get_waf_cookies_with_playwright', fake_waf)
 
 
 def agentrouter_account(**overrides) -> AccountConfig:
@@ -34,8 +48,14 @@ class TestOAuthBranchWiring:
 	def test_verified_check_in_reports_success(self, monkeypatch):
 		captured = {}
 
-		def fake_oauth(account_name, domain, upstream_cookie, api_user, session_cookie, provider):
-			captured.update(domain=domain, upstream_cookie=upstream_cookie, api_user=api_user, session=session_cookie)
+		def fake_oauth(account_name, domain, upstream_cookie, api_user, session_cookie, provider, waf_cookies):
+			captured.update(
+				domain=domain,
+				upstream_cookie=upstream_cookie,
+				api_user=api_user,
+				session=session_cookie,
+				waf=waf_cookies,
+			)
 			result = {
 				'verified': True,
 				'already_claimed': False,
@@ -51,12 +71,14 @@ class TestOAuthBranchWiring:
 
 		monkeypatch.setattr(checkin, 'check_in_via_oauth', fake_oauth)
 
-		success, before, after = checkin.check_in_with_github_oauth(agentrouter_account(), 'AG1', provider())
+		success, before, after = checkin.check_in_with_github_oauth(agentrouter_account(), 'AG1', provider(), FAKE_WAF)
 
 		assert success is True
 		assert captured['domain'] == 'https://agentrouter.org'
 		assert captured['upstream_cookie'] == 'gh-token'
 		assert captured['session'] == 'stale-session'
+		# 浏览器解出的 WAF 凭据必须传到本站请求里，否则机房 IP 会被挑战页顶回来
+		assert captured['waf'] == FAKE_WAF
 		# 主流程用 before/after 算收益，两者都要可用
 		assert before['success'] is True
 		assert after['success'] is True
@@ -87,7 +109,7 @@ class TestOAuthBranchWiring:
 	def test_falls_back_to_backup_domain(self, monkeypatch):
 		attempts = []
 
-		def fake_oauth(account_name, domain, upstream_cookie, api_user, session_cookie, provider):
+		def fake_oauth(account_name, domain, upstream_cookie, api_user, session_cookie, provider, waf_cookies):
 			attempts.append(domain)
 			if 'agentrouter.org' in domain:
 				return False, None, 'WAF 拦截'
@@ -160,3 +182,52 @@ class TestAccountLevelGuards:
 
 		assert len(result) == 3
 		assert result[0] is False
+
+
+class TestWafCookiesForLoginTriggered:
+	"""agentrouter 在阿里云 WAF 后面，登录触发型路径也得先解挑战（CI 实测）"""
+
+	async def test_dispatcher_fetches_and_forwards_waf(self, monkeypatch):
+		captured = {}
+		monkeypatch.setattr(
+			checkin,
+			'check_in_via_oauth',
+			lambda **kw: (captured.update(kw), (False, None, 'stop'))[1],
+		)
+
+		await checkin.check_in_account(agentrouter_account(), 0, AppConfig.load_from_env())
+
+		assert captured['waf_cookies'] == FAKE_WAF
+
+	async def test_browser_gets_login_page_url(self, monkeypatch):
+		seen = {}
+
+		async def fake_waf(account_name, login_url, required):
+			seen.update(url=login_url, required=list(required))
+			return dict(FAKE_WAF)
+
+		monkeypatch.setattr(checkin, 'get_waf_cookies_with_playwright', fake_waf)
+		monkeypatch.setattr(checkin, 'check_in_via_oauth', lambda **kw: (False, None, 'stop'))
+
+		await checkin.check_in_account(agentrouter_account(), 0, AppConfig.load_from_env())
+
+		assert seen['url'] == 'https://agentrouter.org/login'
+		assert 'acw_sc__v2' in seen['required']
+
+	async def test_proceeds_when_waf_unavailable(self, monkeypatch):
+		"""浏览器拿不到 cookie 也要继续试直连——住宅 IP 本来就不需要"""
+		captured = {}
+
+		async def no_waf(account_name, login_url, required):
+			return None
+
+		monkeypatch.setattr(checkin, 'get_waf_cookies_with_playwright', no_waf)
+		monkeypatch.setattr(
+			checkin,
+			'check_in_via_oauth',
+			lambda **kw: (captured.update(kw), (False, None, 'stop'))[1],
+		)
+
+		await checkin.check_in_account(agentrouter_account(), 0, AppConfig.load_from_env())
+
+		assert captured['waf_cookies'] is None
