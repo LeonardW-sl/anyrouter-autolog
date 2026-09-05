@@ -9,6 +9,11 @@ on:
         description: '只跑这些站点（逗号分隔，如 agentrouter）。留空跑全部'
         required: false
         default: ''
+      probe_waf:
+        description: '只跑 WAF 诊断，不签到（不带凭据）'
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   checkin:
@@ -83,7 +88,15 @@ jobs:
         Write-Host "随机延迟 $delay 秒后开始"
         Start-Sleep -Seconds $delay
 
+    # 诊断路径：不读任何 secret，不触发签到，只看 WAF 拦在哪一层
+    - name: WAF 诊断
+      if: inputs.probe_waf
+      run: |
+        Write-Host "出口 IP: $((Invoke-WebRequest -Uri 'https://api.ipify.org').Content)"
+        uv run python tools/waf_probe.py
+
     - name: 执行签到
+      if: ${{ !inputs.probe_waf }}
       env:
         ANYROUTER_ACCOUNTS: ${{ secrets.ANYROUTER_ACCOUNTS }}
         PROVIDERS: ${{ secrets.PROVIDERS }}
