@@ -18,6 +18,7 @@ from utils.agentrouter_oauth import (
 	LINUXDO,
 	REWARD_UNITS,
 	build_check_in_result,
+	describe_non_json,
 	exchange_oauth_callback,
 	fetch_oauth_state,
 	format_upstream_cookie,
@@ -423,6 +424,40 @@ class TestBuildCheckInResult:
 		assert result['user_id'] == 223050
 		assert result['display_name'] == 'Suli Wang'
 		assert result['used_quota'] == 7
+
+
+class TestDescribeNonJson:
+	"""机房 IP 被 WAF 顶回来时，报错要能认出拦截方"""
+
+	def test_includes_status_and_single_line_body(self):
+		response = httpx.Response(200, text='<!doctype html>\n<html>\n  <body>blocked</body>\n</html>')
+		desc = describe_non_json(response)
+
+		assert 'HTTP 200' in desc
+		assert '\n' not in desc
+		assert '<!doctype html> <html> <body>blocked' in desc
+
+	def test_surfaces_cloudflare_markers(self):
+		response = httpx.Response(
+			403,
+			headers={'server': 'cloudflare', 'cf-mitigated': 'challenge', 'cf-ray': 'abc123'},
+			text='Just a moment...',
+		)
+		desc = describe_non_json(response)
+
+		assert 'server=cloudflare' in desc
+		assert 'cf-mitigated=challenge' in desc
+
+	def test_surfaces_waf_cookie_names(self):
+		response = httpx.Response(
+			200,
+			headers=[('set-cookie', 'acw_sc__v2=xyz; Path=/'), ('set-cookie', 'acw_tc=abc; Path=/')],
+			text='<html><script>var arg1=...</script></html>',
+		)
+		desc = describe_non_json(response)
+
+		assert 'acw_sc__v2' in desc
+		assert 'acw_tc' in desc
 
 
 class TestRewardVisibleInDelta:

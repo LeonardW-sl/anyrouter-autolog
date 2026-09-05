@@ -181,7 +181,7 @@ def fetch_oauth_state(client: httpx.Client, domain: str) -> tuple[str | None, st
 	try:
 		payload = response.json()
 	except ValueError:
-		return None, f'state 接口返回非 JSON: {response.text[:80]}'
+		return None, f'state 接口返回非 JSON: {describe_non_json(response)}'
 
 	if payload.get('success') and payload.get('data'):
 		return str(payload['data']), None
@@ -319,7 +319,7 @@ def exchange_oauth_callback(
 	try:
 		payload = response.json()
 	except ValueError:
-		return None, f'OAuth 回调返回非 JSON (HTTP {response.status_code}): {response.text[:80]}'
+		return None, f'OAuth 回调返回非 JSON: {describe_non_json(response)}'
 
 	if payload.get('success'):
 		data = payload.get('data') or {}
@@ -359,7 +359,7 @@ def password_login(
 	try:
 		payload = response.json()
 	except ValueError:
-		return None, f'登录接口返回非 JSON (HTTP {response.status_code}): {response.text[:80]}'
+		return None, f'登录接口返回非 JSON: {describe_non_json(response)}'
 
 	if payload.get('success'):
 		data = payload.get('data') or {}
@@ -392,6 +392,29 @@ def fetch_user_self(client: httpx.Client, domain: str, api_user: str | None) -> 
 	if payload.get('success') and isinstance(payload.get('data'), dict):
 		return payload['data']
 	return None
+
+
+def describe_non_json(response: httpx.Response) -> str:
+	"""接口该返回 JSON 却返回了别的，把能认出拦截方的线索压成一行
+
+	机房 IP 常被 WAF 拿 JS 挑战页顶回来（HTTP 200 + HTML）。光看 body 开头
+	分不清是挑战页、前端 SPA 还是网关错误页，所以连响应头一起报。
+	"""
+	marks = []
+	for header in ('server', 'cf-mitigated', 'cf-ray', 'via', 'x-cache'):
+		value = response.headers.get(header)
+		if value:
+			marks.append(f'{header}={value[:40]}')
+
+	# 直接读 set-cookie 头，不走 response.cookies——那个要求 response 上挂着
+	# request 实例，错误处理路径不该有这种依赖，自己崩掉最糟。
+	names = sorted({raw.split('=', 1)[0].strip() for raw in response.headers.get_list('set-cookie') if '=' in raw})
+	if names:
+		marks.append(f'set-cookie={",".join(names)[:60]}')
+
+	body = ' '.join(response.text.split())[:160]
+	prefix = f'HTTP {response.status_code}'
+	return f'{prefix} [{" ".join(marks)}] {body}' if marks else f'{prefix} {body}'
 
 
 def has_check_in_log_today(client: httpx.Client, domain: str, api_user: str | None) -> bool:
