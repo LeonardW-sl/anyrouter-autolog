@@ -21,7 +21,7 @@ FAKE_WAF = {'acw_tc': 'a', 'cdn_sec_tc': 'b', 'acw_sc__v2': 'c'}
 def stub_waf(monkeypatch):
 	"""agentrouter 现在要过阿里云 WAF，单元测试不该真起浏览器"""
 
-	async def fake_waf(account_name, login_url, required):
+	async def fake_waf(account_name, login_url, required, allow_partial=False):
 		return dict(FAKE_WAF)
 
 	monkeypatch.setattr(checkin, 'get_waf_cookies_with_playwright', fake_waf)
@@ -202,8 +202,8 @@ class TestWafCookiesForLoginTriggered:
 	async def test_browser_gets_login_page_url(self, monkeypatch):
 		seen = {}
 
-		async def fake_waf(account_name, login_url, required):
-			seen.update(url=login_url, required=list(required))
+		async def fake_waf(account_name, login_url, required, allow_partial=False):
+			seen.update(url=login_url, required=list(required), partial=allow_partial)
 			return dict(FAKE_WAF)
 
 		monkeypatch.setattr(checkin, 'get_waf_cookies_with_playwright', fake_waf)
@@ -211,14 +211,16 @@ class TestWafCookiesForLoginTriggered:
 
 		await checkin.check_in_account(agentrouter_account(), 0, AppConfig.load_from_env())
 
-		assert seen['url'] == 'https://agentrouter.org/login'
+		# 必须去被拦的 API，不是不被拦的登录页——否则挑战不弹，acw_sc__v2 拿不到
+		assert seen['url'] == 'https://agentrouter.org/api/oauth/state?mode=login'
 		assert 'acw_sc__v2' in seen['required']
+		assert seen['partial'] is True
 
 	async def test_proceeds_when_waf_unavailable(self, monkeypatch):
 		"""浏览器拿不到 cookie 也要继续试直连——住宅 IP 本来就不需要"""
 		captured = {}
 
-		async def no_waf(account_name, login_url, required):
+		async def no_waf(account_name, login_url, required, allow_partial=False):
 			return None
 
 		monkeypatch.setattr(checkin, 'get_waf_cookies_with_playwright', no_waf)

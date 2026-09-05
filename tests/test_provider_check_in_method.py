@@ -32,6 +32,19 @@ class TestAgentRouterDefaults:
 		assert provider.bypass_method == 'waf_cookies'
 		assert 'acw_sc__v2' in provider.waf_cookie_names
 
+	def test_warmup_targets_challenged_api(self):
+		"""/login 是前端页面不被拦，浏览器必须去打被拦的 API 才能拿到 acw_sc__v2"""
+		provider = AppConfig.load_from_env().get_provider('agentrouter')
+
+		assert provider.waf_warmup_url() == 'https://agentrouter.org/api/oauth/state?mode=login'
+		assert provider.waf_warmup_url('https://ps.air-outer.com').startswith('https://ps.air-outer.com/api/')
+
+	def test_anyrouter_warmup_defaults_to_login_page(self):
+		"""anyrouter 的 /login 本身就被拦，不用改"""
+		provider = AppConfig.load_from_env().get_provider('anyrouter')
+
+		assert provider.waf_warmup_url() == 'https://anyrouter.top/login'
+
 	def test_backup_domain_available(self):
 		provider = AppConfig.load_from_env().get_provider('agentrouter')
 		domains = provider.candidate_domains()

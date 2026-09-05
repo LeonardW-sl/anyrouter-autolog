@@ -25,7 +25,7 @@ FAKE_WAF = {'acw_tc': 'a', 'cdn_sec_tc': 'b', 'acw_sc__v2': 'c'}
 def stub_waf(monkeypatch):
 	"""agentrouter 现在要过阿里云 WAF，单元测试不该真起浏览器"""
 
-	async def fake_waf(account_name, login_url, required):
+	async def fake_waf(account_name, login_url, required, allow_partial=False):
 		return dict(FAKE_WAF)
 
 	monkeypatch.setattr(checkin, 'get_waf_cookies_with_playwright', fake_waf)

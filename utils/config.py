@@ -24,6 +24,10 @@ class ProviderConfig:
 	check_in_method: Literal['sign_in_api', 'github_oauth', 'password_login'] = 'sign_in_api'
 	backup_domain: str | None = None
 	login_api_path: str = '/api/user/login'
+	# 浏览器去哪个地址触发 WAF 挑战。acw_sc__v2 只在挑战真的弹出后才下发，
+	# 所以这个地址必须是会被拦的那个——两个站的拦截位置不一样：
+	# anyrouter 的 /login 页面就被拦，agentrouter 只拦 API。
+	waf_warmup_path: str | None = None
 
 	def __post_init__(self):
 		required_waf_cookies = set()
@@ -61,11 +65,20 @@ class ProviderConfig:
 			check_in_method=data.get('check_in_method', 'sign_in_api'),
 			backup_domain=data.get('backup_domain'),
 			login_api_path=data.get('login_api_path', '/api/user/login'),
+			waf_warmup_path=data.get('waf_warmup_path'),
 		)
 
 	def needs_waf_cookies(self) -> bool:
 		"""判断是否需要获取 WAF cookies"""
 		return self.bypass_method == 'waf_cookies'
+
+	def waf_warmup_url(self, domain: str | None = None) -> str:
+		"""浏览器该访问哪个地址来触发 WAF 挑战
+
+		默认用登录页，配了 waf_warmup_path 就用它——只拦 API 的站点必须指到
+		被拦的接口上，否则浏览器一路畅通，拿不到 acw_sc__v2。
+		"""
+		return f'{domain or self.domain}{self.waf_warmup_path or self.login_path}'
 
 	def uses_password_login(self) -> bool:
 		"""判断是否靠账号密码重新登录触发签到
@@ -127,7 +140,10 @@ class AppConfig:
 				user_info_path='/api/user/self',
 				api_user_key='new-api-user',
 				bypass_method='waf_cookies',
-				waf_cookie_names=['acw_tc', 'cdn_sec_tc', 'acw_sc__v2'],
+				waf_cookie_names=['acw_tc', 'acw_sc__v2'],
+				# /login 是前端页面，不被拦；挑战只在 API 上弹，所以浏览器得去
+				# 打这个接口，否则拿不到 acw_sc__v2（CI 实测只拿到 acw_tc）。
+				waf_warmup_path='/api/oauth/state?mode=login',
 				check_in_method='github_oauth',
 				backup_domain='https://ps.air-outer.com',
 			),

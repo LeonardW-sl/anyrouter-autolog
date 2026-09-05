@@ -71,8 +71,14 @@ def parse_cookies(cookies_data):
 	return {}
 
 
-async def get_waf_cookies_with_playwright(account_name: str, login_url: str, required_cookies: list[str]):
-	"""使用 Playwright 获取 WAF cookies（隐私模式）"""
+async def get_waf_cookies_with_playwright(
+	account_name: str, login_url: str, required_cookies: list[str], allow_partial: bool = False
+):
+	"""使用 Playwright 获取 WAF cookies（隐私模式）
+
+	allow_partial 为真时，少几个 cookie 也把拿到的返回去——挑战没弹时
+	acw_sc__v2 本来就不会下发，此时带着已有的 cookie 直连往往就能过。
+	"""
 	print(f'[PROCESSING] {account_name}: Starting browser to get WAF cookies...')
 
 	async with async_playwright() as p:
@@ -119,9 +125,15 @@ async def get_waf_cookies_with_playwright(account_name: str, login_url: str, req
 				missing_cookies = [c for c in required_cookies if c not in waf_cookies]
 
 				if missing_cookies:
-					print(f'[FAILED] {account_name}: Missing WAF cookies: {missing_cookies}')
+					if not (allow_partial and waf_cookies):
+						print(f'[FAILED] {account_name}: Missing WAF cookies: {missing_cookies}')
+						await context.close()
+						return None
+
+					got = ','.join(sorted(waf_cookies))
+					print(f'[INFO] {account_name}: Partial WAF cookies ({got}), missing {missing_cookies}')
 					await context.close()
-					return None
+					return waf_cookies
 
 				print(f'[SUCCESS] {account_name}: Successfully got all WAF cookies')
 
@@ -411,9 +423,11 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	if login_triggered:
 		waf_cookies = None
 		if provider_config.needs_waf_cookies():
-			login_url = f'{provider_config.domain}{provider_config.login_path}'
 			waf_cookies = await get_waf_cookies_with_playwright(
-				account_name, login_url, provider_config.waf_cookie_names
+				account_name,
+				provider_config.waf_warmup_url(),
+				provider_config.waf_cookie_names,
+				allow_partial=True,
 			)
 			if not waf_cookies:
 				print(f'[WARNING] {account_name}: WAF cookies unavailable, trying direct request anyway')
