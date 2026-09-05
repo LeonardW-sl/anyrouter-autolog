@@ -166,6 +166,12 @@ class TestCheckInDispatch:
 			'display_name': 'x',
 		}
 
+	def _http_config(self):
+		"""关掉浏览器内签到，露出底下的 httpx 分派逻辑"""
+		app_config = AppConfig.load_from_env()
+		app_config.get_provider('agentrouter').check_in_in_browser = False
+		return app_config
+
 	async def test_password_preferred_over_oauth(self, monkeypatch):
 		"""agentrouter 默认是 github_oauth，但配了密码就该走密码"""
 		called = {}
@@ -182,13 +188,56 @@ class TestCheckInDispatch:
 		monkeypatch.setattr(checkin, 'check_in_via_oauth', fake_oauth)
 
 		success, before, after = await checkin.check_in_account(
-			self._account(oauth_cookie='gh'), 0, AppConfig.load_from_env()
+			self._account(oauth_cookie='gh'), 0, self._http_config()
 		)
 
 		assert success is True
 		assert 'pw' in called
 		assert 'oauth' not in called
 		assert called['pw']['username'] == 'linuxdo_245573'
+
+	async def test_browser_path_wins_when_enabled(self, monkeypatch):
+		"""开了 check_in_in_browser 就整条链路进浏览器，不再抠 cookie 给 httpx"""
+		called = {}
+
+		async def fake_browser(account, account_name, provider_config):
+			called['browser'] = account_name
+			return True, self._result(), None
+
+		def fake_pw(**kw):
+			called['pw'] = kw
+			return True, self._result(), None
+
+		monkeypatch.setattr(checkin, 'check_in_in_browser', fake_browser)
+		monkeypatch.setattr(checkin, 'check_in_via_password', fake_pw)
+
+		success, _, _ = await checkin.check_in_account(self._account(oauth_cookie='gh'), 0, AppConfig.load_from_env())
+
+		assert success is True
+		assert 'browser' in called
+		assert 'pw' not in called
+
+	async def test_browser_path_skipped_without_password(self, monkeypatch):
+		"""浏览器路径只支持密码登录，没密码就回落到原来的 OAuth 重放"""
+		called = {}
+
+		async def fake_browser(account, account_name, provider_config):
+			called['browser'] = account_name
+			return True, self._result(), None
+
+		def fake_oauth(**kw):
+			called['oauth'] = kw
+			return True, self._result(), None
+
+		monkeypatch.setattr(checkin, 'check_in_in_browser', fake_browser)
+		monkeypatch.setattr(checkin, 'check_in_via_oauth', fake_oauth)
+
+		account = self._account(username=None, password=None, oauth_cookie='gh')
+		success, _, _ = await checkin.check_in_account(account, 0, AppConfig.load_from_env())
+
+		assert success is True
+		assert 'browser' not in called
+		assert 'oauth' in called
 
 	async def test_oauth_still_used_without_password(self, monkeypatch):
 		called = {}

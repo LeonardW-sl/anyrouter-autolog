@@ -28,6 +28,9 @@ class ProviderConfig:
 	# 所以这个地址必须是会被拦的那个——两个站的拦截位置不一样：
 	# anyrouter 的 /login 页面就被拦，agentrouter 只拦 API。
 	waf_warmup_path: str | None = None
+	# 整条链路都在浏览器里跑，而不是抠出 cookie 交给 httpx。
+	# acw_sc__v2 绑浏览器上下文，抠出来重放很脆——UA/IP/时序任一不吻合就失效。
+	check_in_in_browser: bool = False
 
 	def __post_init__(self):
 		required_waf_cookies = set()
@@ -66,6 +69,7 @@ class ProviderConfig:
 			backup_domain=data.get('backup_domain'),
 			login_api_path=data.get('login_api_path', '/api/user/login'),
 			waf_warmup_path=data.get('waf_warmup_path'),
+			check_in_in_browser=bool(data.get('check_in_in_browser', False)),
 		)
 
 	def needs_waf_cookies(self) -> bool:
@@ -144,6 +148,7 @@ class AppConfig:
 				# /login 是前端页面，不被拦；挑战只在 API 上弹，所以浏览器得去
 				# 打这个接口，否则拿不到 acw_sc__v2（CI 实测只拿到 acw_tc）。
 				waf_warmup_path='/api/oauth/state?mode=login',
+				check_in_in_browser=True,
 				check_in_method='github_oauth',
 				backup_domain='https://ps.air-outer.com',
 			),

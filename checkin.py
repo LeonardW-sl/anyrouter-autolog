@@ -15,10 +15,15 @@ from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
 from utils.agentrouter_oauth import (
+	CHECK_IN_LOG_TYPE,
+	USER_AGENT,
+	build_check_in_result,
 	check_in_via_oauth,
 	check_in_via_password,
 	get_oauth_provider,
+	is_timestamp_today,
 	quota_to_usd,
+	reward_visible_in_delta,
 )
 from utils.config import AccountConfig, AppConfig, load_accounts_config
 from utils.notify import notify
@@ -145,6 +150,219 @@ async def get_waf_cookies_with_playwright(
 				print(f'[FAILED] {account_name}: Error occurred while getting WAF cookies: {e}')
 				await context.close()
 				return None
+
+
+BROWSER_FETCH_JS = """
+async ({ path, method, body, apiUser }) => {
+	const headers = { 'Accept': 'application/json' };
+	if (body !== null) headers['Content-Type'] = 'application/json';
+	if (apiUser) headers['New-Api-User'] = String(apiUser);
+
+	const response = await fetch(path, {
+		method,
+		headers,
+		credentials: 'include',
+		body: body === null ? undefined : JSON.stringify(body),
+	});
+
+	return { status: response.status, text: await response.text() };
+}
+"""
+
+
+async def browser_api_call(
+	page, path: str, method: str = 'GET', body: dict | None = None, api_user: str | None = None
+) -> tuple[int, str]:
+	"""在浏览器里发请求，而不是把 cookie 抠出来给 httpx
+
+	阿里云 WAF 的 acw_sc__v2 是挑战 JS 算出来的，绑浏览器上下文。「浏览器解挑战
+	→ 抠 cookie → httpx 重放」这个交接本身就脆：UA、IP、时序任一不吻合就失效。
+	直接让浏览器自己发，挑战它自己解、cookie 它自己带，整个交接就不存在了。
+
+	Returns:
+		(status, text) —— 网络层失败时 status 为 0
+	"""
+	try:
+		result = await page.evaluate(
+			BROWSER_FETCH_JS, {'path': path, 'method': method, 'body': body, 'apiUser': api_user}
+		)
+	except Exception as e:
+		return 0, f'{type(e).__name__}: {str(e)[:120]}'
+
+	return int(result.get('status') or 0), str(result.get('text') or '')
+
+
+def parse_api_json(status: int, text: str, label: str) -> tuple[dict | None, str | None]:
+	"""解析浏览器里拿回的响应，非 JSON 时把拦截线索报出来"""
+	if status == 0:
+		return None, f'{label} 请求失败: {text[:120]}'
+
+	try:
+		payload = json.loads(text)
+	except ValueError:
+		body = ' '.join(text.split())[:140]
+		return None, f'{label} 返回非 JSON (HTTP {status}): {body}'
+
+	if not isinstance(payload, dict):
+		return None, f'{label} 返回结构异常 (HTTP {status})'
+
+	return payload, None
+
+
+async def inject_session_cookie(page, account: AccountConfig) -> bool:
+	"""把配置里那份旧 session 注入浏览器，用来读签到前基线
+
+	必须在 page.goto 之后调用：cookie 的 domain 要跟着当前页面的 origin 走，
+	否则注进去也不会被带上。
+	"""
+	session_cookie = account.get_session_cookie()
+	if not session_cookie:
+		return False
+
+	try:
+		await page.context.add_cookies([{'name': 'session', 'value': session_cookie, 'url': page.url}])
+	except Exception as e:
+		print(f'[INFO] Session cookie injection failed ({type(e).__name__}), baseline unavailable')
+		return False
+	return True
+
+
+async def run_browser_check_in(page, account: AccountConfig, account_name: str, provider_config):
+	"""在已经过了 WAF 的页面上完成登录与核验"""
+	api_user = account.api_user
+
+	# 基线：登录前的余额。浏览器是全新 profile，没有登录态，所以先把配置里那份旧
+	# session 注进去——纯读操作，不触发签到。拿不到就靠日志核验，不影响判定。
+	quota_before = None
+	if await inject_session_cookie(page, account):
+		status, text = await browser_api_call(page, provider_config.user_info_path, api_user=api_user)
+		payload, _ = parse_api_json(status, text, '用户信息')
+		if payload and isinstance(payload.get('data'), dict):
+			raw = payload['data'].get('quota')
+			if isinstance(raw, (int, float)):
+				quota_before = int(raw)
+				print(f'[INFO] {account_name}: 签到前余额 ${quota_to_usd(quota_before)}')
+
+	if quota_before is None:
+		print(f'[INFO] {account_name}: 未取到签到前余额基线，将改用站内日志核验')
+
+	# 登录：签到就是这个 handler 的副作用
+	status, text = await browser_api_call(
+		page,
+		f'{provider_config.login_api_path}?turnstile=',
+		method='POST',
+		body={'username': account.username, 'password': account.password},
+	)
+	payload, error = parse_api_json(status, text, '登录接口')
+	if payload is None:
+		print(f'[FAILED] {account_name}: {error}')
+		return False, {'success': False, 'error': error}, None
+
+	if not payload.get('success'):
+		message = str(payload.get('message') or '登录被拒')[:120]
+		print(f'[FAILED] {account_name}: 登录失败: {message}')
+		return False, {'success': False, 'error': f'登录失败: {message}'}, None
+
+	print(f'[SUCCESS] {account_name}: 密码登录完成，登录态已刷新')
+
+	# 复读余额（登录响应里的 user 是精简对象，quota 恒为 0，不能拿来算）
+	status, text = await browser_api_call(page, provider_config.user_info_path, api_user=api_user)
+	payload, error = parse_api_json(status, text, '用户信息')
+	user = payload.get('data') if payload and isinstance(payload.get('data'), dict) else {}
+
+	log_confirms_today = False
+	if not reward_visible_in_delta(user, quota_before, quota_before is not None):
+		log_confirms_today = await browser_log_confirms_today(page, provider_config, api_user)
+
+	result = build_check_in_result(user, quota_before, quota_before is not None, log_confirms_today)
+	success = bool(result['verified'] or result['already_claimed'])
+
+	before, after = shape_check_in_result(result, success, account_name)
+	return success, before, after
+
+
+async def browser_log_confirms_today(page, provider_config, api_user: str | None) -> bool:
+	"""在浏览器里查站内日志有没有今天的签到记录"""
+	path = f'/api/log/self?p=1&page_size=20&type={CHECK_IN_LOG_TYPE}'
+	status, text = await browser_api_call(page, path, api_user=api_user)
+	payload, _ = parse_api_json(status, text, '日志')
+	if not payload:
+		return False
+
+	data = payload.get('data')
+	items = data.get('items') if isinstance(data, dict) else data
+	if not isinstance(items, list):
+		return False
+
+	return any(
+		isinstance(item, dict)
+		and item.get('type') == CHECK_IN_LOG_TYPE
+		and is_timestamp_today(item.get('created_at') or item.get('timestamp'))
+		for item in items
+	)
+
+
+async def check_in_in_browser(account: AccountConfig, account_name: str, provider_config):
+	"""整条签到链路都在浏览器里跑（agentrouter 这类被 WAF 拦 API 的站点）
+
+	只支持密码登录：OAuth 重放要跨到上游站点，在浏览器里做等于把 Cloudflare
+	那套也搬进来，不划算。
+	"""
+	if not account.has_password_credentials():
+		return False, {'success': False, 'error': 'username/password not configured'}, None
+
+	print(f'[PROCESSING] {account_name}: Signing in inside browser (WAF-protected API)')
+
+	async with async_playwright() as p:
+		import tempfile
+
+		with tempfile.TemporaryDirectory() as temp_dir:
+			context = await p.chromium.launch_persistent_context(
+				user_data_dir=temp_dir,
+				headless=False,
+				user_agent=USER_AGENT,
+				viewport={'width': 1920, 'height': 1080},
+				args=[
+					'--disable-blink-features=AutomationControlled',
+					'--disable-dev-shm-usage',
+					'--no-sandbox',
+				],
+			)
+
+			try:
+				last_error = None
+				last_result = None
+
+				for domain in provider_config.candidate_domains():
+					page = await context.new_page()
+					try:
+						# 先渲染一次登录页，让 WAF 的挑战 JS 在真正的文档上下文里跑完
+						await page.goto(f'{domain}{provider_config.login_path}', wait_until='networkidle')
+						try:
+							await page.wait_for_function('document.readyState === "complete"', timeout=8000)
+						except Exception:
+							await page.wait_for_timeout(3000)
+
+						# fetch 用的是相对路径，所以请求跟着当前页面的 origin 走
+						success, before, after = await run_browser_check_in(
+							page, account, account_name, provider_config
+						)
+						if success:
+							return success, before, after
+
+						last_result = (before, after)
+						last_error = (before or {}).get('error')
+					except Exception as e:
+						last_error = f'browser: {type(e).__name__}: {str(e)[:120]}'
+						print(f'[FAILED] {account_name}: {domain} -> {last_error}')
+					finally:
+						await page.close()
+
+				if last_result:
+					return False, last_result[0], last_result[1]
+				return False, {'success': False, 'error': last_error or 'browser check-in failed'}, None
+			finally:
+				await context.close()
 
 
 def get_user_info(client, headers, user_info_url: str):
@@ -421,6 +639,11 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	# 浏览器解一次挑战，把 cookie 带进后面的请求。
 	login_triggered = provider_config.uses_password_login() or provider_config.uses_github_oauth()
 	if login_triggered:
+		# 整条链路在浏览器里跑：没有 cookie 交接，所以不用先解挑战抠 cookie。
+		# 只有密码登录能走这条——OAuth 重放要跨到上游站点，搬进浏览器不划算。
+		if provider_config.check_in_in_browser and account.has_password_credentials():
+			return await check_in_in_browser(account, account_name, provider_config)
+
 		waf_cookies = None
 		if provider_config.needs_waf_cookies():
 			waf_cookies = await get_waf_cookies_with_playwright(
@@ -503,6 +726,21 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		client.close()
 
 
+def filter_accounts_by_provider(accounts: list, only_providers: str | None) -> list:
+	"""按 provider 白名单筛账号，留空则全跑
+
+	白名单用逗号分隔，大小写不敏感。名字写错时直接返回空列表，由调用方报错退出——
+	静默跑全部账号比报错更糟：分支验证时会连带打到另一个站点。
+	"""
+	names = {n.strip().lower() for n in (only_providers or '').split(',') if n.strip()}
+	if not names:
+		return accounts
+
+	kept = [a for a in accounts if a.provider.lower() in names]
+	print(f'[INFO] CHECKIN_ONLY_PROVIDERS={",".join(sorted(names))} -> {len(kept)}/{len(accounts)} accounts')
+	return kept
+
+
 async def main():
 	"""主函数"""
 	print('[SYSTEM] AnyRouter.top multi-account auto check-in script started (using Playwright)')
@@ -517,6 +755,12 @@ async def main():
 		sys.exit(1)
 
 	print(f'[INFO] Found {len(accounts)} account configurations')
+
+	# 只跑指定站点：分支上验证一个 provider 时，不该把另一个站点也拖进来反复试错
+	accounts = filter_accounts_by_provider(accounts, os.getenv('CHECKIN_ONLY_PROVIDERS'))
+	if not accounts:
+		print('[FAILED] No accounts left after CHECKIN_ONLY_PROVIDERS filter, program exits')
+		sys.exit(1)
 
 	last_balance_hash = load_balance_hash()
 

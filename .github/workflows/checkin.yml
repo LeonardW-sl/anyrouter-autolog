@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '0 9,23 * * *'
   workflow_dispatch:
+    inputs:
+      only_providers:
+        description: '只跑这些站点（逗号分隔，如 agentrouter）。留空跑全部'
+        required: false
+        default: ''
 
 jobs:
   checkin:
@@ -92,6 +97,7 @@ jobs:
         AG2_PASSWORD: ${{ secrets.AG2_PASSWORD }}
         CHECKIN_USER_AGENT: ${{ vars.CHECKIN_USER_AGENT }}
         ACCOUNT_INTERVAL_SECONDS: ${{ vars.ACCOUNT_INTERVAL_SECONDS }}
+        CHECKIN_ONLY_PROVIDERS: ${{ inputs.only_providers }}
         DINGDING_WEBHOOK: ${{ secrets.DINGDING_WEBHOOK }}
         EMAIL_USER: ${{ secrets.EMAIL_USER }}
         EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
