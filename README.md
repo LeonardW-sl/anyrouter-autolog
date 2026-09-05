@@ -101,18 +101,18 @@ python config/convert_cookie.py
     {
       "name": "agentrouter账号",
       "provider": "agentrouter.org",
-      "cookies": {
-        "session": "你的session值"
-      },
-      "api_user": "你的api_user值"
+      "api_user": "你的api_user值",
+      "github_cookie": "env:GH_SESSION_1"
     }
   ]
 ```
 
 **字段说明**：
 
-- `cookies` (必需)：用于身份验证的 cookies 数据
 - `api_user` (必需)：用于请求头的 new-api-user 参数
+- `cookies` (必需，`github_cookie` 方式除外)：用于身份验证的 cookies 数据
+- `github_cookie` (agentrouter 必需)：GitHub 的 `user_session` cookie，用于重放 OAuth 登录触发签到。
+  支持 `env:变量名` 形式间接引用，把真实凭据放在环境变量或 Actions secrets 里，不写进账号 JSON
 - `provider` (可选)：指定使用的服务商，默认为 `anyrouter`
 - `name` (可选)：自定义账号显示名称，用于通知和日志中标识账号
 
@@ -121,6 +121,10 @@ python config/convert_cookie.py
 - 如果未提供 `provider` 字段，默认使用 `anyrouter`（向后兼容）
 - 如果未提供 `name` 字段，会使用 `Account 1`、`Account 2` 等默认名称
 - `anyrouter` 与 `agentrouter` 配置已内置，无需填写
+
+> **agentrouter 的签到方式与 anyrouter 不同**：它没有签到接口，每日 $25 由服务端登录 handler 发放，
+> 必须重放一次 GitHub OAuth 登录才会触发。带着已有 session 调任何接口都不会签到成功。
+> 详见下文「agentrouter：GitHub OAuth 签到」。
 
 接下来获取 cookies 与 api_user 的值。
 
@@ -269,6 +273,11 @@ python config/convert_cookie.py
   - `"waf_cookies"`：使用 Playwright 打开浏览器获取 WAF cookies 后再执行签到
   - 不设置或 `null`：直接使用用户 cookies 执行签到（适合无 WAF 保护的网站）
 - `waf_cookie_names` (可选)：绕过 WAF 所需 cookie 的名称列表，`bypass_method` 为 `waf_cookies` 时必须设置
+- `check_in_method` (可选)：签到触发方式，默认为 `sign_in_api`
+  - `"sign_in_api"`：POST `sign_in_path` 调用签到接口
+  - `"github_oauth"`：站点没有签到接口，靠重放 GitHub OAuth 登录触发（agentrouter 属于这类），
+    账号需配置 `github_cookie`，不需要 Playwright
+- `backup_domain` (可选)：备用域名，主域名被 DNS 污染或 WAF 拦截时自动回退
 
 **配置示例**（完整）：
 
@@ -288,16 +297,137 @@ python config/convert_cookie.py
 **内置配置说明**：
 
 - `anyrouter`：
+  - `check_in_method: "sign_in_api"`
+  - `sign_in_path: "/api/user/sign_in"`
   - `bypass_method: "waf_cookies"`（需要先获取 WAF cookies，然后执行签到）
-  - `sign_in_path: "/api/user/sign_in"`
 - `agentrouter`：
-  - `bypass_method: null`（直接使用用户 cookies 执行签到）
-  - `sign_in_path: "/api/user/sign_in"`
+  - `check_in_method: "github_oauth"`（没有签到接口，靠重放 GitHub OAuth 登录触发）
+  - `sign_in_path: null`
+  - `bypass_method: null`（`acw_tc` 直接请求即可获得，不需要 Playwright）
+  - `backup_domain: "https://ps.air-outer.com"`
 
 **重要提示**：
 
 - `PROVIDERS` 是可选的，不配置则使用内置的 `anyrouter` 和 `agentrouter`
 - 自定义的 provider 配置会覆盖同名的默认配置
+
+## agentrouter：GitHub OAuth 签到
+
+agentrouter 与 anyrouter 的机制完全不同，配置方式也不一样。
+
+### 为什么需要单独处理
+
+agentrouter 没有签到接口。每日 $25 额度由服务端的登录 handler 发放，登录回包里带 `checked_in`
+字段。常见签到路径（`/api/user/sign_in`、`/api/user/check_in`、`/api/user/checkin` 等）POST 全部
+返回 404，GET 返回「权限不足」。**带着已有 session 调用任何接口都不会触发签到**，必须真的重走一次
+登录鉴权。
+
+GitHub OAuth 注册的账号没有密码（`/api/user/self` 里 `password` 为空、`username` 是
+`github_xxxxxx` 这类自动生成值），所以密码登录也走不通，只能重放 OAuth：
+
+1. `GET /api/oauth/state` 取 state token（约 10 分钟过期），同时下发 `acw_tc` 与匿名 `session`
+2. `GET github.com/login/oauth/authorize` 带 `user_session` cookie 换 authorization code
+3. `GET /api/oauth/github?code=...&state=...` 回调，触发签到
+
+第 1 步与第 3 步必须共用同一个 cookie jar：state 校验依赖第 1 步下发的匿名 session。
+
+### 获取 GitHub user_session
+
+1. 浏览器登录 GitHub
+2. F12 → Application → Cookies → `https://github.com`
+3. 复制 `user_session` 的值
+
+该 cookie 官方有效期两周且滚动续期（每次使用都会刷新），每天签到相当于每天续命。会导致失效的操作：
+改密码、手动登出、在 Settings → Sessions 里 revoke。多设备登录不会互相踢掉。
+
+> **安全提示**：`user_session` 等价于你的 GitHub 账号本身，权限无法像 PAT 那样收窄。放进 Actions
+> secrets 前请自行权衡；只在本地跑（cron/计划任务）风险更小。
+
+### 配置
+
+账号配置里用 `env:` 间接引用，凭据本身放环境变量或 Actions secrets：
+
+```json
+[
+  {
+    "name": "AgentRouter账号1",
+    "provider": "agentrouter",
+    "api_user": "223050",
+    "github_cookie": "env:GH_SESSION_1"
+  },
+  {
+    "name": "AgentRouter账号2",
+    "provider": "agentrouter",
+    "api_user": "245573",
+    "github_cookie": "env:GH_SESSION_2"
+  }
+]
+```
+
+可选地补上 `cookies.session`（站内 session）：脚本会用它读取签到前余额作为基线，从而在通知里给出
+精确的「签到获得 +$25」。不填也能签到，此时改用站内日志核验。
+
+### 成功判定
+
+脚本不会仅凭「请求没报错」就宣布成功，判定按硬证据分三档：
+
+| 结果 | 依据 |
+| --- | --- |
+| 已核实到账 | 额度增量 ≥ $25（基线新鲜），或 `/api/log/self` 有今天的签到记录 |
+| 今日已签到 | `last_login_time` 是今天但额度无增量 |
+| 失败 | 上述证据都不成立 |
+
+只要额度增量没能证明到账，就一定会去查日志——不会退而用「登录时间是今天」猜。
+查日志时带 `type=4` 让服务端过滤：高频账号不过滤的话第一页会被消费记录占满，
+今天的签到记录被挤到后面几页，核验就假阴性了。
+
+### 更省事的替代：密码登录
+
+签到额度由「登录」这个动作发放，而 OAuth 只是登录方式之一。如果账号有密码，
+`POST /api/user/login` 一个请求就能触发签到，不必碰上游站点：
+
+| | 密码登录 | OAuth 重放 |
+| --- | --- | --- |
+| 请求数 | 1 个 POST | GitHub 1 跳；LinuxDO 4 跳 SSO + 授权页 |
+| 上游反爬 | 不涉及 | LinuxDO 有 Cloudflare JS 挑战 |
+| 凭据寿命 | 密码，基本永久 | GitHub cookie 两周滚动；`cf_clearance` 绑 IP+UA |
+| 能跑在 Actions | 能 | GitHub 待验；LinuxDO 不能 |
+| 泄露影响面 | 仅本站账号 | 整个 GitHub / LinuxDO 账号 |
+
+OAuth 注册的账号 `password` 字段为空，需要先重置一次：
+
+1. 打开 `https://agentrouter.org/login` → 「忘记密码？」→ 填账号绑定的邮箱
+2. 收信点链接 → 落地页确认
+3. 站点会**自动生成**一个密码并复制到剪贴板（不能自选；拿到后可再用「修改密码」改）
+
+重置不会影响原有的 OAuth 登录，账号仍可继续用 GitHub / LinuxDO 登录。
+
+配置（`username` 用站内用户名，不是邮箱）：
+
+```json
+{
+  "name": "AgentRouter账号2",
+  "provider": "agentrouter",
+  "api_user": "245573",
+  "username": "env:AG2_USERNAME",
+  "password": "env:AG2_PASSWORD"
+}
+```
+
+`username` / `password` 都填上时优先走密码登录；留空则自动回落到 OAuth，
+所以可以先只给一个账号配密码，另一个不受影响。
+
+实测：LinuxDO 身份的账号（OAuth 侧被 Cloudflare 挑战挡住）改走密码登录后签到正常，
+证据来自 `/api/log/self` 的 `type=4` 记录。
+
+### 注意事项
+
+- 站点按出口 IP 对登录限流（连打约 3 次触发 429，罚时约 60 秒）。脚本默认在账号之间等待 75 秒，
+  可用 `ACCOUNT_INTERVAL_SECONDS` 调整
+- GitHub Actions 的数据中心 IP 能否通过 agentrouter 的阿里 WAF 未经验证，首次部署建议手动触发
+  一次确认；被拦截时改用本地定时任务，或给 Actions 配代理
+- 站点公告禁止「无意义的刷额度行为」。每日登录领取额度是站点设计的功能本身，但多账号定时程序化
+  登录处于灰区，建议随机化执行时间、不要过量
 
 ## 开启通知
 
@@ -317,7 +447,16 @@ python config/convert_cookie.py
 
 ### 飞书机器人
 
-- `FEISHU_WEBHOOK`: 飞书机器人的 Webhook 地址
+- `FEISHU_WEBHOOK`: 飞书机器人的 Webhook 地址（所有站点共用）
+- `FEISHU_WEBHOOK_ANYROUTER`: 只推 anyrouter 结果的机器人（可选）
+- `FEISHU_WEBHOOK_AGENTROUTER`: 只推 agentrouter 结果的机器人（可选）
+
+通知按 provider 分开发送：anyrouter 和 agentrouter 各出一条卡片，标题分别是
+`AnyRouter Check-in Alert` 和 `AgentRouter Check-in Alert`，统计数字也各算各的。
+
+选哪个机器人的规则是 `FEISHU_WEBHOOK_<PROVIDER>` 优先、没配就回落到 `FEISHU_WEBHOOK`。
+所以想推到同一个群里，只配 `FEISHU_WEBHOOK` 就行——照样会收到两条独立卡片；
+想分群就把两个专用变量都配上。
 
 ### 企业微信机器人
 

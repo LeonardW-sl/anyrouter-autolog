@@ -21,6 +21,9 @@ class ProviderConfig:
 	api_user_key: str = 'new-api-user'
 	bypass_method: Literal['waf_cookies'] | None = None
 	waf_cookie_names: List[str] | None = None
+	check_in_method: Literal['sign_in_api', 'github_oauth', 'password_login'] = 'sign_in_api'
+	backup_domain: str | None = None
+	login_api_path: str = '/api/user/login'
 
 	def __post_init__(self):
 		required_waf_cookies = set()
@@ -55,15 +58,39 @@ class ProviderConfig:
 			api_user_key=data.get('api_user_key', 'new-api-user'),
 			bypass_method=data.get('bypass_method'),
 			waf_cookie_names=data.get('waf_cookie_names'),
+			check_in_method=data.get('check_in_method', 'sign_in_api'),
+			backup_domain=data.get('backup_domain'),
+			login_api_path=data.get('login_api_path', '/api/user/login'),
 		)
 
 	def needs_waf_cookies(self) -> bool:
 		"""判断是否需要获取 WAF cookies"""
 		return self.bypass_method == 'waf_cookies'
 
+	def uses_password_login(self) -> bool:
+		"""判断是否靠账号密码重新登录触发签到
+
+		和 OAuth 同一个服务端 handler，但只需一个 POST，且不受上游反爬影响。
+		"""
+		return self.check_in_method == 'password_login'
+
+	def uses_github_oauth(self) -> bool:
+		"""判断是否靠重放 GitHub OAuth 触发签到
+
+		这类站点（agentrouter）没有签到接口，额度由登录 handler 发放。
+		"""
+		return self.check_in_method == 'github_oauth'
+
 	def needs_manual_check_in(self) -> bool:
 		"""判断是否需要手动调用签到接口"""
-		return self.sign_in_path is not None
+		return self.check_in_method == 'sign_in_api' and self.sign_in_path is not None
+
+	def candidate_domains(self) -> List[str]:
+		"""主域名 + 备用域名（主域名被 DNS 污染/WAF 拦时回退）"""
+		domains = [self.domain]
+		if self.backup_domain and self.backup_domain not in domains:
+			domains.append(self.backup_domain)
+		return domains
 
 
 @dataclass
@@ -86,15 +113,19 @@ class AppConfig:
 				bypass_method='waf_cookies',
 				waf_cookie_names=['acw_tc', 'cdn_sec_tc', 'acw_sc__v2'],
 			),
+			# agentrouter 没有签到接口：每日 $25 由服务端登录 handler 发放，
+			# 必须重放一次 GitHub OAuth 登录才会触发。带旧 session 查任何接口都没用。
 			'agentrouter': ProviderConfig(
 				name='agentrouter',
 				domain='https://agentrouter.org',
 				login_path='/login',
-				sign_in_path=None,  # 无需签到接口，查询用户信息时自动完成签到
+				sign_in_path=None,
 				user_info_path='/api/user/self',
 				api_user_key='new-api-user',
-				bypass_method='waf_cookies',
-				waf_cookie_names=['acw_tc'],
+				bypass_method=None,  # acw_tc 直接 curl 就能拿到，无需 Playwright
+				waf_cookie_names=None,
+				check_in_method='github_oauth',
+				backup_domain='https://ps.air-outer.com',
 			),
 		}
 
@@ -144,7 +175,7 @@ class AppConfig:
 		# 移除协议前缀
 		for prefix in ('https://', 'http://'):
 			if normalized.startswith(prefix):
-				normalized = normalized[len(prefix):]
+				normalized = normalized[len(prefix) :]
 				break
 		# 移除尾部斜杠
 		normalized = normalized.rstrip('/')
@@ -153,7 +184,7 @@ class AppConfig:
 			domain = provider.domain.lower()
 			for prefix in ('https://', 'http://'):
 				if domain.startswith(prefix):
-					domain = domain[len(prefix):]
+					domain = domain[len(prefix) :]
 					break
 			domain = domain.rstrip('/')
 			if domain == normalized:
@@ -170,6 +201,10 @@ class AccountConfig:
 	api_user: str
 	provider: str = 'anyrouter'
 	name: str | None = None
+	oauth_cookie: str | None = None
+	oauth_provider: str = 'github'
+	username: str | None = None
+	password: str | None = None
 
 	@classmethod
 	def from_dict(cls, data: dict, index: int) -> 'AccountConfig':
@@ -177,11 +212,61 @@ class AccountConfig:
 		provider = data.get('provider', 'anyrouter')
 		name = data.get('name', f'Account {index + 1}')
 
-		return cls(cookies=data['cookies'], api_user=data['api_user'], provider=provider, name=name if name else None)
+		# oauth_cookie 是新名字，github_cookie 保留兼容
+		oauth_cookie = data.get('oauth_cookie') or data.get('github_cookie')
+		oauth_provider = data.get('oauth_provider') or 'github'
+
+		return cls(
+			cookies=data.get('cookies') or {},
+			api_user=data['api_user'],
+			provider=provider,
+			name=name if name else None,
+			oauth_cookie=resolve_secret(oauth_cookie),
+			oauth_provider=str(oauth_provider).strip().lower(),
+			username=resolve_secret(data.get('username')),
+			password=resolve_secret(data.get('password')),
+		)
+
+	def has_password_credentials(self) -> bool:
+		"""是否具备密码登录所需凭据"""
+		return bool(self.username and self.password)
 
 	def get_display_name(self, index: int) -> str:
 		"""获取显示名称"""
 		return self.name if self.name else f'Account {index + 1}'
+
+	def get_session_cookie(self) -> str | None:
+		"""取站内 session cookie（用于读签到前余额基线）"""
+		if isinstance(self.cookies, dict):
+			value = self.cookies.get('session')
+			return str(value) if value else None
+		if isinstance(self.cookies, str):
+			for pair in self.cookies.split(';'):
+				if '=' in pair:
+					key, value = pair.strip().split('=', 1)
+					if key == 'session':
+						return value
+		return None
+
+
+def resolve_secret(value: str | None) -> str | None:
+	"""解析 "env:VAR" 形式的间接引用
+
+	让账号 JSON 里只写变量名，真正的凭据放环境变量/Actions secrets。
+	"""
+	if not value or not isinstance(value, str):
+		return None
+	trimmed = value.strip()
+	if trimmed.startswith('env:'):
+		env_name = trimmed[4:].strip()
+		if not env_name:
+			return None
+		resolved = os.getenv(env_name)
+		if not resolved:
+			print(f'[WARNING] Environment variable "{env_name}" referenced but not set')
+			return None
+		return resolved.strip()
+	return trimmed
 
 
 def load_accounts_config() -> list[AccountConfig] | None:
@@ -204,8 +289,15 @@ def load_accounts_config() -> list[AccountConfig] | None:
 				print(f'ERROR: Account {i + 1} configuration format is incorrect')
 				return None
 
-			if 'cookies' not in account_dict or 'api_user' not in account_dict:
-				print(f'ERROR: Account {i + 1} missing required fields (cookies, api_user)')
+			if 'api_user' not in account_dict:
+				print(f'ERROR: Account {i + 1} missing required field (api_user)')
+				return None
+
+			# OAuth 重放与密码登录都不需要站内 cookies（session 由登录现取）
+			has_oauth_cookie = 'oauth_cookie' in account_dict or 'github_cookie' in account_dict
+			has_password = 'username' in account_dict and 'password' in account_dict
+			if 'cookies' not in account_dict and not has_oauth_cookie and not has_password:
+				print(f'ERROR: Account {i + 1} needs one of: cookies, oauth_cookie, or username+password')
 				return None
 
 			if 'name' in account_dict and not account_dict['name']:

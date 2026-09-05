@@ -70,10 +70,28 @@ jobs:
         restore-keys: |
           balance-hash-
 
+    # 定时任务准点触发太规律，随机延迟一下；手动触发不延迟
+    - name: 随机延迟
+      if: github.event_name == 'schedule'
+      run: |
+        $delay = Get-Random -Minimum 0 -Maximum 900
+        Write-Host "随机延迟 $delay 秒后开始"
+        Start-Sleep -Seconds $delay
+
     - name: 执行签到
       env:
         ANYROUTER_ACCOUNTS: ${{ secrets.ANYROUTER_ACCOUNTS }}
         PROVIDERS: ${{ secrets.PROVIDERS }}
+        GH_SESSION_1: ${{ secrets.GH_SESSION_1 }}
+        GH_SESSION_2: ${{ secrets.GH_SESSION_2 }}
+        LINUXDO_SESSION_2: ${{ secrets.LINUXDO_SESSION_2 }}
+        # agentrouter 密码登录：比重放 OAuth 稳，不受上游 Cloudflare 挑战影响
+        AG1_USERNAME: ${{ secrets.AG1_USERNAME }}
+        AG1_PASSWORD: ${{ secrets.AG1_PASSWORD }}
+        AG2_USERNAME: ${{ secrets.AG2_USERNAME }}
+        AG2_PASSWORD: ${{ secrets.AG2_PASSWORD }}
+        CHECKIN_USER_AGENT: ${{ vars.CHECKIN_USER_AGENT }}
+        ACCOUNT_INTERVAL_SECONDS: ${{ vars.ACCOUNT_INTERVAL_SECONDS }}
         DINGDING_WEBHOOK: ${{ secrets.DINGDING_WEBHOOK }}
         EMAIL_USER: ${{ secrets.EMAIL_USER }}
         EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
@@ -83,6 +101,8 @@ jobs:
         PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
         SERVERPUSHKEY: ${{ secrets.SERVERPUSHKEY }}
         FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+        FEISHU_WEBHOOK_ANYROUTER: ${{ secrets.FEISHU_WEBHOOK_ANYROUTER }}
+        FEISHU_WEBHOOK_AGENTROUTER: ${{ secrets.FEISHU_WEBHOOK_AGENTROUTER }}
         WEIXIN_WEBHOOK: ${{ secrets.WEIXIN_WEBHOOK }}
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}

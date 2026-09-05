@@ -18,9 +18,10 @@
   {
     "name": "agentrouter账号",
     "provider": "agentrouter.org",
+    "api_user": "用户值",
+    "github_cookie": "env:GH_SESSION_1",
     "cookies": {
-      "session": "session值"
-    },
-    "api_user": "用户值"
+      "session": "可选，仅用于读取签到前余额基线"
+    }
   }
 ]

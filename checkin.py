@@ -14,6 +14,12 @@ import httpx
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
+from utils.agentrouter_oauth import (
+	check_in_via_oauth,
+	check_in_via_password,
+	get_oauth_provider,
+	quota_to_usd,
+)
 from utils.config import AccountConfig, AppConfig, load_accounts_config
 from utils.notify import notify
 
@@ -207,6 +213,32 @@ def execute_check_in(client, account_name: str, provider_config, headers: dict):
 		return False
 
 
+PROVIDER_TITLES = {'anyrouter': 'AnyRouter', 'agentrouter': 'AgentRouter'}
+
+
+def provider_title(name: str) -> str:
+	"""通知标题里用的 provider 显示名"""
+	return PROVIDER_TITLES.get(name, name)
+
+
+def build_summary(success_count: int, total_count: int) -> list[str]:
+	"""签到结果统计段"""
+	summary = [
+		'[STATS] Check-in result statistics:',
+		f'[SUCCESS] Success: {success_count}/{total_count}',
+		f'[FAIL] Failed: {total_count - success_count}/{total_count}',
+	]
+
+	if success_count == total_count:
+		summary.append('[SUCCESS] All accounts check-in successful!')
+	elif success_count > 0:
+		summary.append('[WARN] Some accounts check-in successful')
+	else:
+		summary.append('[ERROR] All accounts check-in failed')
+
+	return summary
+
+
 def format_check_in_notification(detail: dict) -> str:
 	"""格式化签到通知消息
 
@@ -256,6 +288,106 @@ def format_check_in_notification(detail: dict) -> str:
 	return '\n'.join(lines)
 
 
+def shape_check_in_result(result: dict, success: bool, account_name: str):
+	"""把签到结果转成主流程期望的 (before, after) 结构
+
+	基线不可信时把 before 标记为失败，避免主流程算出假的签到收益。
+	"""
+	print(f'[{"SUCCESS" if success else "FAILED"}] {account_name}: {result["message"]}')
+
+	quota_after = quota_to_usd(result.get('quota'))
+	used_after = quota_to_usd(result.get('used_quota'))
+	user_info_after = {
+		'success': True,
+		'quota': quota_after,
+		'used_quota': used_after,
+		'display': f':money: Current balance: ${quota_after}, Used: ${used_after}',
+	}
+
+	delta = result.get('quota_delta')
+	if delta is not None:
+		before_quota = quota_to_usd(result['quota'] - delta)
+		user_info_before = {
+			'success': True,
+			'quota': before_quota,
+			'used_quota': used_after,
+			'display': f':money: Current balance: ${before_quota}, Used: ${used_after}',
+		}
+	else:
+		user_info_before = {'success': False, 'error': 'Balance baseline unavailable'}
+
+	return user_info_before, user_info_after
+
+
+def check_in_with_password(account: AccountConfig, account_name: str, provider_config):
+	"""用账号密码重新登录触发签到
+
+	依次尝试主域名与备用域名，返回与普通签到一致的三元组。
+	"""
+	last_error = None
+
+	for domain in provider_config.candidate_domains():
+		if domain != provider_config.domain:
+			print(f'[INFO] {account_name}: Retrying with backup domain {domain}')
+
+		success, result, error = check_in_via_password(
+			account_name=account_name,
+			domain=domain,
+			username=account.username,
+			password=account.password,
+			api_user=account.api_user,
+			session_cookie=account.get_session_cookie(),
+			login_path=provider_config.login_api_path,
+		)
+
+		if result:
+			before, after = shape_check_in_result(result, success, account_name)
+			return success, before, after
+
+		last_error = error
+		print(f'[FAILED] {account_name}: {error}')
+
+	return False, {'success': False, 'error': last_error or 'Password check-in failed'}, None
+
+
+def check_in_with_github_oauth(account: AccountConfig, account_name: str, provider_config):
+	"""重放 GitHub OAuth 完成签到（agentrouter 这类无签到接口的站点）
+
+	依次尝试主域名与备用域名，返回与普通签到一致的三元组。
+	"""
+	last_error = None
+
+	try:
+		oauth_provider = get_oauth_provider(account.oauth_provider)
+	except ValueError as e:
+		print(f'[FAILED] {account_name}: {e}')
+		return False, {'success': False, 'error': str(e)}, None
+
+	print(f'[INFO] {account_name}: Replaying {oauth_provider.name} OAuth to trigger check-in')
+
+	for domain in provider_config.candidate_domains():
+		if domain != provider_config.domain:
+			print(f'[INFO] {account_name}: Retrying with backup domain {domain}')
+
+		success, result, error = check_in_via_oauth(
+			account_name=account_name,
+			domain=domain,
+			upstream_cookie=account.oauth_cookie,
+			api_user=account.api_user,
+			session_cookie=account.get_session_cookie(),
+			provider=oauth_provider,
+		)
+
+		if result:
+			before, after = shape_check_in_result(result, success, account_name)
+			return success, before, after
+
+		last_error = error
+		print(f'[FAILED] {account_name}: {error}')
+
+	return False, {'success': False, 'error': last_error or 'OAuth check-in failed'}, None
+
+
 async def check_in_account(account: AccountConfig, account_index: int, app_config: AppConfig):
 	"""为单个账号执行签到操作"""
 	account_name = account.get_display_name(account_index)
@@ -264,18 +396,37 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	provider_config = app_config.get_provider(account.provider)
 	if not provider_config:
 		print(f'[FAILED] {account_name}: Provider "{account.provider}" not found in configuration')
-		return False, None
+		return False, None, None
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
+
+	# 密码登录：一个 POST 就能触发签到，不碰上游站点
+	if provider_config.uses_password_login():
+		if not account.has_password_credentials():
+			print(f'[FAILED] {account_name}: Provider requires username/password but none configured')
+			return False, {'success': False, 'error': 'username/password not configured'}, None
+		return check_in_with_password(account, account_name, provider_config)
+
+	# 账号配了密码就优先用它，比 OAuth 重放稳
+	if provider_config.uses_github_oauth() and account.has_password_credentials():
+		print(f'[INFO] {account_name}: Password credentials present, preferring password login over OAuth')
+		return check_in_with_password(account, account_name, provider_config)
+
+	# OAuth 重放路径不需要站内 cookies，也不需要浏览器
+	if provider_config.uses_github_oauth():
+		if not account.oauth_cookie:
+			print(f'[FAILED] {account_name}: Provider requires oauth_cookie but none configured')
+			return False, {'success': False, 'error': 'oauth_cookie not configured'}, None
+		return check_in_with_github_oauth(account, account_name, provider_config)
 
 	user_cookies = parse_cookies(account.cookies)
 	if not user_cookies:
 		print(f'[FAILED] {account_name}: Invalid configuration format')
-		return False, None
+		return False, None, None
 
 	all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
 	if not all_cookies:
-		return False, None
+		return False, None, None
 
 	client = httpx.Client(http2=True, timeout=30.0)
 
@@ -309,10 +460,12 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 			user_info_after = get_user_info(client, headers, user_info_url)
 			return success, user_info_before, user_info_after
 		else:
-			print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
-			# 自动签到的情况，再次获取用户信息
+			# 既没有签到接口，又没有配置 OAuth 重放：查用户信息不会触发签到，
+			# 这里不能报成功，否则就是当前上游那种"假成功"。
+			print(f'[FAILED] {account_name}: No check-in method available for this provider')
+			print(f'[HINT] {account_name}: Set sign_in_path, or use check_in_method="github_oauth" with github_cookie')
 			user_info_after = get_user_info(client, headers, user_info_url)
-			return True, user_info_before, user_info_after
+			return False, user_info_before, user_info_after
 
 	except Exception as e:
 		print(f'[FAILED] {account_name}: Error occurred during check-in process - {str(e)[:50]}...')
@@ -338,9 +491,18 @@ async def main():
 
 	last_balance_hash = load_balance_hash()
 
+	# 站点按出口 IP 对登录限流（连打约 3 次触发 429，罚时约 60s），账号之间留间隔
+	try:
+		account_interval = int(os.getenv('ACCOUNT_INTERVAL_SECONDS') or 75)
+	except ValueError:
+		print('[WARNING] Invalid ACCOUNT_INTERVAL_SECONDS, falling back to 75')
+		account_interval = 75
+
 	success_count = 0
 	total_count = len(accounts)
-	notification_content = []
+	# 按 provider 分账：每个站点单独出一条通知，好推给各自的飞书机器人
+	notification_by_provider: dict[str, list[str]] = {}
+	provider_stats: dict[str, dict[str, int]] = {}
 	current_balances = {}
 	account_check_in_details = {}  # 存储每个账号的签到详情
 	need_notify = False  # 是否需要发送通知
@@ -348,10 +510,18 @@ async def main():
 
 	for i, account in enumerate(accounts):
 		account_key = f'account_{i + 1}'
+		stats = provider_stats.setdefault(account.provider, {'success': 0, 'total': 0})
+		stats['total'] += 1
+
+		if i > 0 and account_interval > 0:
+			print(f'[INFO] Waiting {account_interval}s before next account (IP rate limit)')
+			await asyncio.sleep(account_interval)
+
 		try:
 			success, user_info_before, user_info_after = await check_in_account(account, i, app_config)
 			if success:
 				success_count += 1
+				stats['success'] += 1
 
 			should_notify_this_account = False
 
@@ -389,6 +559,7 @@ async def main():
 
 					account_check_in_details[account_key] = {
 						'name': account.get_display_name(i),
+						'provider': account.provider,
 						'before_quota': before_quota,
 						'before_used': before_used,
 						'after_quota': after_quota,
@@ -407,13 +578,15 @@ async def main():
 					account_result += f'\n{user_info_after["display"]}'
 				elif user_info_after:
 					account_result += f'\n{user_info_after.get("error", "Unknown error")}'
-				notification_content.append(account_result)
+				notification_by_provider.setdefault(account.provider, []).append(account_result)
 
 		except Exception as e:
 			account_name = account.get_display_name(i)
 			print(f'[FAILED] {account_name} processing exception: {e}')
 			need_notify = True  # 异常也需要通知
-			notification_content.append(f'[FAIL] {account_name} exception: {str(e)[:50]}...')
+			notification_by_provider.setdefault(account.provider, []).append(
+				f'[FAIL] {account_name} exception: {str(e)[:50]}...'
+			)
 
 	# 检查余额变化
 	current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
@@ -443,34 +616,32 @@ async def main():
 				account_result = format_check_in_notification(detail)
 
 				# 检查是否已经在通知内容中（避免重复）
-				if not any(account_name in item for item in notification_content):
-					notification_content.append(account_result)
+				bucket = notification_by_provider.setdefault(detail['provider'], [])
+				if not any(account_name in item for item in bucket):
+					bucket.append(account_result)
 
 	# 保存当前余额hash
 	if current_balance_hash:
 		save_balance_hash(current_balance_hash)
 
-	if need_notify and notification_content:
-		# 构建通知内容
-		summary = [
-			'[STATS] Check-in result statistics:',
-			f'[SUCCESS] Success: {success_count}/{total_count}',
-			f'[FAIL] Failed: {total_count - success_count}/{total_count}',
-		]
-
-		if success_count == total_count:
-			summary.append('[SUCCESS] All accounts check-in successful!')
-		elif success_count > 0:
-			summary.append('[WARN] Some accounts check-in successful')
-		else:
-			summary.append('[ERROR] All accounts check-in failed')
-
+	if need_notify and any(notification_by_provider.values()):
 		time_info = f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
 
-		notify_content = '\n\n'.join([time_info, '\n'.join(notification_content), '\n'.join(summary)])
+		# 每个 provider 各发一条，飞书可按站点推给不同机器人
+		for provider_name in sorted(notification_by_provider):
+			lines = notification_by_provider[provider_name]
+			if not lines:
+				continue
 
-		print(notify_content)
-		notify.push_message('AnyRouter Check-in Alert', notify_content, msg_type='text')
+			stats = provider_stats.get(provider_name, {'success': 0, 'total': len(lines)})
+			summary = build_summary(stats['success'], stats['total'])
+			notify_content = '\n\n'.join([time_info, '\n'.join(lines), '\n'.join(summary)])
+			title = f'{provider_title(provider_name)} Check-in Alert'
+
+			print(f'=== {title} ===')
+			print(notify_content)
+			notify.push_message(title, notify_content, msg_type='text', provider=provider_name)
+
 		print('[NOTIFY] Notification sent due to failures or balance changes')
 	else:
 		print('[INFO] All accounts successful and no balance changes detected, notification skipped')

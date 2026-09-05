@@ -70,8 +70,22 @@ class NotificationKit:
 		with httpx.Client(timeout=30.0) as client:
 			client.post(self.dingding_webhook, json=data)
 
-	def send_feishu(self, title: str, content: str):
-		if not self.feishu_webhook:
+	def feishu_webhook_for(self, provider: str | None = None) -> str | None:
+		"""按 provider 选飞书机器人
+
+		FEISHU_WEBHOOK_<PROVIDER> 优先，没配就回落到共用的 FEISHU_WEBHOOK。
+		这里读实时环境变量而不是 __init__ 时的快照——checkin.py 的 load_dotenv()
+		在 import 本模块之后才执行，构造期读到的是 None。
+		"""
+		if provider:
+			dedicated = (os.getenv(f'FEISHU_WEBHOOK_{provider.strip().upper()}') or '').strip()
+			if dedicated:
+				return dedicated
+		return (os.getenv('FEISHU_WEBHOOK') or self.feishu_webhook or '').strip() or None
+
+	def send_feishu(self, title: str, content: str, provider: str | None = None):
+		webhook = self.feishu_webhook_for(provider)
+		if not webhook:
 			raise ValueError('Feishu Webhook not configured')
 
 		data = {
@@ -82,7 +96,7 @@ class NotificationKit:
 			},
 		}
 		with httpx.Client(timeout=30.0) as client:
-			client.post(self.feishu_webhook, json=data)
+			client.post(webhook, json=data)
 
 	def send_wecom(self, title: str, content: str):
 		if not self.weixin_webhook:
@@ -136,13 +150,19 @@ class NotificationKit:
 		with httpx.Client(timeout=30.0) as client:
 			client.post(url, json=data)
 
-	def push_message(self, title: str, content: str, msg_type: Literal['text', 'html'] = 'text'):
+	def push_message(
+		self,
+		title: str,
+		content: str,
+		msg_type: Literal['text', 'html'] = 'text',
+		provider: str | None = None,
+	):
 		notifications = [
 			('Email', lambda: self.send_email(title, content, msg_type)),
 			('PushPlus', lambda: self.send_pushplus(title, content)),
 			('Server Push', lambda: self.send_serverPush(title, content)),
 			('DingTalk', lambda: self.send_dingtalk(title, content)),
-			('Feishu', lambda: self.send_feishu(title, content)),
+			('Feishu', lambda: self.send_feishu(title, content, provider)),
 			('WeChat Work', lambda: self.send_wecom(title, content)),
 			('Gotify', lambda: self.send_gotify(title, content)),
 			('Telegram', lambda: self.send_telegram(title, content)),
